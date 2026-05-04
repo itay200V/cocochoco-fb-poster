@@ -1,0 +1,21 @@
+# Facebook session — NEVER commit these
+fb_cookies.json
+
+# Campaign config contains local image paths — keep a template version locally
+fb_campaign_config.json
+fb_campaign_config_test.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# macOS
+.DS_Store
+
+# Stray files
+=*
+
+# Logs
+*.log

@@ -1,0 +1,21 @@
+{
+  "_comment": "COCOCHOCO Academy Open House — 3 post templates. Claude picks one at random each run and rewrites it with fresh phrasing while keeping all facts.",
+
+  "templates": [
+    {
+      "id": "open_house_energetic",
+      "tone": "energetic",
+      "text": "🎉 COCOCHOCO Academy Bangkok จัดงาน OPEN HOUSE!\n\nสนใจอาชีพช่างทำผมมืออาชีพ? มาลองดูก่อนได้เลย!\n\nเข้าร่วม Open House กับเราและเรียนรู้หลักสูตร Professional Keratin & Hair Treatment\n📅 ทุกวันเสาร์ เวลา 10:00 – 14:00 น.\n📍 กรุงเทพฯ (แจ้งสถานที่ทาง Line OA)\n\nสิ่งที่คุณจะได้รับ:\n✅ เรียนกับผู้เชี่ยวชาญ Keratin มืออาชีพ\n✅ ใบรับรองระดับสากลจาก COCOCHOCO\n✅ รับส่วนลดพิเศษสำหรับผู้ลงทะเบียนในงาน\n✅ ทดลองใช้ผลิตภัณฑ์ Keratin ของจริง\n\nที่นั่งมีจำกัด — สมัครวันนี้!\nLine OA: https://lin.ee/mipAAhk\nโทร: 080-651-3775"
+    },
+    {
+      "id": "open_house_professional",
+      "tone": "professional",
+      "text": "📢 COCOCHOCO Academy Bangkok เรียนเชิญเข้าร่วมงาน Open House\n\nผู้ที่สนใจพัฒนาทักษะด้านการดูแลเส้นผมและเคราติน ไม่ควรพลาดโอกาสนี้\n\nหลักสูตร: Professional Keratin & Hair Treatment\n📅 ทุกวันเสาร์ เวลา 10:00 – 14:00 น.\n📍 กรุงเทพฯ (สอบถามสถานที่ทาง Line OA)\n\nผู้เข้าร่วมจะได้รับ:\n• เรียนกับผู้เชี่ยวชาญ Keratin มืออาชีพ\n• ใบรับรองระดับสากลจาก COCOCHOCO\n• ส่วนลดพิเศษสำหรับผู้ที่ลงทะเบียนในงาน\n• ทดลองใช้ผลิตภัณฑ์ Keratin จริง\n\nสำรองที่นั่งได้ที่:\nLine OA: https://lin.ee/mipAAhk\nโทร: 080-651-3775"
+    },
+    {
+      "id": "open_house_friendly",
+      "tone": "friendly",
+      "text": "💇‍♀️ อยากเรียนทำผมกับผู้เชี่ยวชาญจริงๆ ไหมคะ?\n\nCOCOCHOCO Academy Bangkok เปิด Open House ให้เข้ามาลองดูฟรี!\n\nหลักสูตร: Professional Keratin & Hair Treatment\n📅 ทุกวันเสาร์ เวลา 10:00 – 14:00 น.\n📍 กรุงเทพฯ (แจ้งสถานที่ทาง Line OA)\n\nมาแล้วได้อะไร? 😊\n⭐ เรียนกับผู้เชี่ยวชาญ Keratin มืออาชีพ\n⭐ ใบรับรองระดับสากลจาก COCOCHOCO\n⭐ รับส่วนลดพิเศษวันงาน\n⭐ ทดลองใช้ผลิตภัณฑ์ Keratin จริง\n\nแอดมาถามได้เลยนะคะ 💕\nLine OA: https://lin.ee/mipAAhk\nโทร: 080-651-3775"
+    }
+  ]
+}
