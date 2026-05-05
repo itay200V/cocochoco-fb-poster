@@ -13,9 +13,11 @@ Google Sheets expected columns:
   active          TRUE / FALSE
   campaign_name   name shown in Telegram report
   template_text   base text sent to Claude for rewriting
-  image_url_1     Cloudinary folder path  (e.g. "cocochoco/open_house")
+  image_url_1     Cloudinary image folder path  (e.g. "cocochoco/open_house")
   group_ids       pipe-separated FB group IDs  (e.g. "123|456|789")
   wait_seconds    seconds between posts (optional, default 15)
+  media_type      images | video | mixed  (default: images)
+  video_folder    Cloudinary video folder  (default: <image_url_1>_video)
 
 ENV VARS:
   ANTHROPIC_API_KEY            Claude API key
@@ -132,10 +134,16 @@ def load_campaign_from_sheets(sheet_id: str) -> dict:
         log("לא נמצאו group_ids בשורת הקמפיין", "ERROR")
         sys.exit(1)
 
+    image_folder = str(row.get("image_url_1", ""))
+    media_type   = str(row.get("media_type", "images")).strip().lower() or "images"
+    video_folder = str(row.get("video_folder", "")).strip() or f"{image_folder}_video"
+
     return {
         "campaign_name": str(row.get("campaign_name", "campaign")),
         "template_text": str(row.get("template_text", "")),
-        "image_folder":  str(row.get("image_url_1", "")),
+        "image_folder":  image_folder,
+        "video_folder":  video_folder,
+        "media_type":    media_type,
         "group_ids":     group_ids,
         "wait":          int(row.get("wait_seconds", 15) or 15),
     }
@@ -179,6 +187,45 @@ def download_cloudinary_images(folder: str, count: int = 8) -> list[str]:
 
     log(f"Cloudinary: {len(paths)} image(s) in pool")
     return paths
+
+
+def download_cloudinary_video(folder: str) -> str | None:
+    """Download one random video from a Cloudinary folder. Returns local path or None."""
+    import cloudinary
+    import cloudinary.api
+
+    cloudinary.config(
+        cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "dhmttntds"),
+        api_key    = os.environ.get("CLOUDINARY_API_KEY"),
+        api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
+    )
+
+    log(f"Cloudinary: listing video folder '{folder}'…")
+    try:
+        result    = cloudinary.api.resources(type="upload", resource_type="video",
+                                             folder=folder, max_results=50)
+        resources = result.get("resources", [])
+    except Exception as exc:
+        log(f"Cloudinary video listing error: {exc}", "WARN")
+        return None
+
+    if not resources:
+        log(f"Cloudinary: no videos found in '{folder}'", "WARN")
+        return None
+
+    res  = random.choice(resources)
+    url  = res["secure_url"]
+    ext  = res.get("format", "mp4")
+    name = res["public_id"].replace("/", "_") + f".{ext}"
+    dest = os.path.join(tempfile.mkdtemp(prefix="fb_video_"), name)
+
+    log(f"  Downloading video: {url}")
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    with open(dest, "wb") as fh:
+        fh.write(resp.content)
+    log(f"Cloudinary: video ready ({len(resp.content) // 1024} KB)")
+    return dest
 
 # ─── System Guidelines ────────────────────────────────────────────────────────
 
@@ -327,7 +374,8 @@ async def send_telegram_report(
     fail: int,
     skipped: int,
     post_text: str,
-    image_names: list[str],
+    media_type: str,
+    media_names: list[str],
 ) -> None:
     token   = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -336,8 +384,9 @@ async def send_telegram_report(
         return
 
     now         = datetime.now().strftime("%d/%m/%Y %H:%M")
-    images_line = _esc(", ".join(image_names) if image_names else "—")
+    media_line  = _esc(", ".join(media_names) if media_names else "—")
     status_line = f"✅ פורסם: {ok}  |  ❌ נכשל: {fail}  |  ⏭ דולג: {skipped}"
+    media_icon  = {"images": "🖼", "video": "🎬", "mixed": "🎬🖼"}.get(media_type, "🖼")
 
     text = (
         f"📊 <b>דוח פרסום — Cocochoco</b>\n"
@@ -346,7 +395,7 @@ async def send_telegram_report(
         f"🕐 תאריך: {now}\n"
         f"{status_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🖼 תמונות: {images_line}\n"
+        f"{media_icon} מדיה ({media_type}): {media_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 <b>טקסט שפורסם:</b>\n{_esc(post_text)}"
     )
@@ -357,32 +406,71 @@ async def send_telegram_report(
         log("דוח טלגרם נשלח")
 
 
-async def send_telegram_photos(image_paths: list[str]) -> None:
+async def send_telegram_media(
+    image_paths: list[str],
+    video_path: str | None,
+    media_type: str,
+) -> None:
+    """Send media preview to Telegram based on media_type (images/video/mixed)."""
     token   = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or not image_paths:
+    if not token or not chat_id:
         return
 
     async with aiohttp.ClientSession() as session:
-        if len(image_paths) == 1:
-            path = image_paths[0]
-            with open(path, "rb") as fh:
+        if media_type == "video" and video_path:
+            with open(video_path, "rb") as fh:
                 data = aiohttp.FormData()
                 data.add_field("chat_id", chat_id)
-                data.add_field("photo", fh, filename=Path(path).name, content_type="image/jpeg")
-                await _tg_post(session, token, "sendPhoto", data=data)
-                log(f"תמונה נשלחה לטלגרם: {Path(path).name}")
-        else:
-            media = [{"type": "photo", "media": f"attach://photo{i}"} for i in range(len(image_paths))]
-            data  = aiohttp.FormData()
+                data.add_field("video", fh, filename=Path(video_path).name,
+                               content_type="video/mp4")
+                await _tg_post(session, token, "sendVideo", data=data)
+            log(f"סרטון נשלח לטלגרם: {Path(video_path).name}")
+
+        elif media_type == "mixed" and video_path and image_paths:
+            # sendMediaGroup: one photo + one video
+            img_path = image_paths[0]
+            media    = [
+                {"type": "photo", "media": "attach://photo0"},
+                {"type": "video", "media": "attach://video0"},
+            ]
+            data = aiohttp.FormData()
             data.add_field("chat_id", chat_id)
             data.add_field("media", json.dumps(media))
-            for i, path in enumerate(image_paths):
-                with open(path, "rb") as fh:
-                    data.add_field(f"photo{i}", fh.read(),
-                                   filename=Path(path).name, content_type="image/jpeg")
+            with open(img_path, "rb") as fh:
+                data.add_field("photo0", fh.read(), filename=Path(img_path).name,
+                               content_type="image/jpeg")
+            with open(video_path, "rb") as fh:
+                data.add_field("video0", fh.read(), filename=Path(video_path).name,
+                               content_type="video/mp4")
             await _tg_post(session, token, "sendMediaGroup", data=data)
-            log(f"{len(image_paths)} תמונות נשלחו לטלגרם")
+            log("תמונה + סרטון נשלחו לטלגרם")
+
+        else:
+            # images mode (or fallback)
+            if not image_paths:
+                return
+            if len(image_paths) == 1:
+                path = image_paths[0]
+                with open(path, "rb") as fh:
+                    data = aiohttp.FormData()
+                    data.add_field("chat_id", chat_id)
+                    data.add_field("photo", fh, filename=Path(path).name,
+                                   content_type="image/jpeg")
+                    await _tg_post(session, token, "sendPhoto", data=data)
+                log(f"תמונה נשלחה לטלגרם: {Path(path).name}")
+            else:
+                media = [{"type": "photo", "media": f"attach://photo{i}"}
+                         for i in range(len(image_paths))]
+                data  = aiohttp.FormData()
+                data.add_field("chat_id", chat_id)
+                data.add_field("media", json.dumps(media))
+                for i, path in enumerate(image_paths):
+                    with open(path, "rb") as fh:
+                        data.add_field(f"photo{i}", fh.read(),
+                                       filename=Path(path).name, content_type="image/jpeg")
+                await _tg_post(session, token, "sendMediaGroup", data=data)
+                log(f"{len(image_paths)} תמונות נשלחו לטלגרם")
 
 # ─── Group validation ─────────────────────────────────────────────────────────
 
@@ -526,15 +614,31 @@ async def main(
     headless:        bool,
     skip_validation: bool,
 ) -> None:
-    campaign = load_campaign_from_sheets(sheet_id)
-    image_pool = download_cloudinary_images(campaign["image_folder"], count=8)
-    cookies    = load_cookies(cookies_path)
+    campaign   = load_campaign_from_sheets(sheet_id)
+    media_type = campaign["media_type"]
+
+    # Download media assets based on media_type
+    image_pool: list[str] = []
+    video_path: str | None = None
+
+    if media_type in ("images", "mixed"):
+        image_pool = download_cloudinary_images(campaign["image_folder"], count=8)
+
+    if media_type in ("video", "mixed"):
+        video_path = download_cloudinary_video(campaign["video_folder"])
+        if video_path is None and media_type == "video":
+            log("No video available and media_type=video — aborting", "ERROR")
+            sys.exit(1)
+
+    cookies = load_cookies(cookies_path)
 
     log("=" * 60)
     log("Cocochoco — Facebook Groups Poster v4 (Sheets + Cloudinary)")
     log(f"Campaign:        {campaign['campaign_name']}")
+    log(f"Media type:      {media_type}")
     log(f"Groups:          {len(campaign['group_ids'])}")
     log(f"Image pool:      {len(image_pool)}")
+    log(f"Video:           {Path(video_path).name if video_path else '—'}")
     log(f"Cookies:         {cookies_path} ({'loaded' if cookies else 'NOT FOUND'})")
     log(f"Headless mode:   {headless}")
     log(f"Skip validation: {skip_validation}")
@@ -603,7 +707,7 @@ async def main(
 
             posted  = load_posted()
             ok = fail = skipped = 0
-            total   = len(group_ids)
+            total       = len(group_ids)
             sample_size = min(3, len(image_pool))
 
             for i, gid in enumerate(group_ids, 1):
@@ -613,10 +717,19 @@ async def main(
                     skipped += 1
                     continue
 
-                # Each group gets its own random image selection
-                group_images = random.sample(image_pool, sample_size)
+                # Build per-group file list based on media_type
+                if media_type == "images":
+                    group_files = random.sample(image_pool, sample_size)
+                elif media_type == "video":
+                    group_files = [video_path] if video_path else []
+                else:  # mixed
+                    group_files = (
+                        [random.choice(image_pool), video_path]
+                        if image_pool and video_path
+                        else (image_pool[:1] or ([video_path] if video_path else []))
+                    )
 
-                success, retryable = await post_to_group(page, gid, group_images, post_text)
+                success, retryable = await post_to_group(page, gid, group_files, post_text)
 
                 if not success and retryable:
                     log(f"  Transient failure — retrying in 15s…", "WARN")
@@ -642,16 +755,19 @@ async def main(
                     for line in fh:
                         log(f"  {line.strip()}", "ERROR")
 
-            image_names = [Path(p).name for p in image_pool]
+            media_names = [Path(p).name for p in image_pool]
+            if video_path:
+                media_names.append(Path(video_path).name)
             await send_telegram_report(
                 campaign_name=campaign["campaign_name"],
                 ok=ok,
                 fail=fail,
                 skipped=skipped,
                 post_text=post_text,
-                image_names=image_names,
+                media_type=media_type,
+                media_names=media_names,
             )
-            await send_telegram_photos(image_pool)
+            await send_telegram_media(image_pool, video_path, media_type)
 
         finally:
             await browser.close()
