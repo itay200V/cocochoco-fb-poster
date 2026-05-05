@@ -1,6 +1,9 @@
 # Facebook session — NEVER commit these
 fb_cookies.json
 
+# Google service account — NEVER commit
+service_account.json
+
 # Campaign config contains local image paths — keep a template version locally
 fb_campaign_config.json
 fb_campaign_config_test.json

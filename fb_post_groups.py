@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-Cocochoco — Facebook Groups Poster v3 (Playwright / Railway edition)
-=====================================================================
-  • Playwright Chromium — headless by default, no external Chrome needed
-  • Facebook auth via saved cookies (fb_cookies.json) — no login prompt
-  • Claude API — generates unique Thai post each run
-  • Telegram report — sent after every run
-  • Railway-ready — works inside Docker with no display
+Cocochoco — Facebook Groups Poster v4 (Google Sheets + Cloudinary)
+===================================================================
+Data flow:
+  1. Read active campaign (active=TRUE) from Google Sheets
+  2. Download 2-3 random images from Cloudinary folder (image_url_1 column)
+  3. Generate Thai Facebook post via Claude API from template_text
+  4. Post to all Facebook groups in the campaign row
+  5. Send Telegram run report
+
+Google Sheets expected columns:
+  active          TRUE / FALSE
+  campaign_name   name shown in Telegram report
+  template_text   base text sent to Claude for rewriting
+  image_url_1     Cloudinary folder path  (e.g. "cocochoco/open_house")
+  group_ids       pipe-separated FB group IDs  (e.g. "123|456|789")
+  wait_seconds    seconds between posts (optional, default 25)
 
 ENV VARS:
-  ANTHROPIC_API_KEY   required for AI text generation (falls back to config text)
-  TELEGRAM_BOT_TOKEN  Telegram bot token for run reports
-  TELEGRAM_CHAT_ID    Telegram chat/channel ID to send reports to
+  ANTHROPIC_API_KEY            Claude API key
+  TELEGRAM_BOT_TOKEN           Telegram bot token
+  TELEGRAM_CHAT_ID             Telegram chat ID
+  CLOUDINARY_API_KEY           Cloudinary API key
+  CLOUDINARY_API_SECRET        Cloudinary API secret
+  CLOUDINARY_CLOUD_NAME        Cloudinary cloud name (default: dhmttntds)
+  GOOGLE_SERVICE_ACCOUNT_JSON  Service account JSON as a string (Railway)
+                               Falls back to service_account.json file
+  GOOGLE_SHEET_ID              Google Sheets ID (overrides --sheet-id)
 
 CLI FLAGS:
-  --config PATH        campaign config JSON  (default: fb_campaign_config.json)
-  --templates PATH     templates JSON        (default: posts_templates.json)
-  --cookies PATH       Facebook cookies JSON (default: fb_cookies.json)
-  --no-headless        show browser window (local debug)
-  --skip-validation    skip hair/beauty group-title check
+  --sheet-id ID         Google Sheets ID
+  --cookies PATH        Facebook cookies JSON (default: fb_cookies.json)
+  --no-headless         show browser window (local debug)
+  --skip-validation     skip hair/beauty group-title check
 """
 from __future__ import annotations
 import asyncio
@@ -31,14 +45,21 @@ from datetime import datetime
 from pathlib import Path
 
 import aiohttp
+import requests
 from playwright.async_api import async_playwright, Page
 
-# ─── Paths / constants ────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-SCRIPT_DIR        = Path(__file__).parent
-DEFAULT_CONFIG    = SCRIPT_DIR / "fb_campaign_config.json"
-DEFAULT_TEMPLATES = SCRIPT_DIR / "posts_templates.json"
-DEFAULT_COOKIES   = SCRIPT_DIR / "fb_cookies.json"
+SCRIPT_DIR      = Path(__file__).parent
+DEFAULT_COOKIES = SCRIPT_DIR / "fb_cookies.json"
+DEFAULT_SHEET   = "1rxfG-DZdgmx4sNHtgfyChvyyQ5Ur4ZutTi_doLhxPjQ"
+
+FIXED_CONTACT = (
+    "\n\n📍 สถานที่: Sivatel Tower, BTS Phlo Chit"
+    "\n📞 โทร: 092-415-0592"
+    "\n📲 Line OA: https://lin.ee/mipAAhk"
+    "\n📝 ลงทะเบียน: https://forms.gle/b78oEZGFbegABH2Y6"
+)
 
 _TMP       = tempfile.gettempdir()
 POSTED_LOG = os.path.join(_TMP, "fb_posted.txt")
@@ -62,101 +83,99 @@ def log(msg: str, level: str = "INFO") -> None:
     with open(RUN_LOG, "a") as fh:
         fh.write(line + "\n")
 
-# ─── Telegram report ──────────────────────────────────────────────────────────
+# ─── Google Sheets ────────────────────────────────────────────────────────────
 
-async def send_telegram_report(
-    campaign_name: str,
-    ok: int,
-    fail: int,
-    skipped: int,
-    post_text: str,
-    image_names: list[str],
-) -> None:
-    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        log("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID לא מוגדרים — דיווח טלגרם מדולג", "WARN")
-        return
+def load_campaign_from_sheets(sheet_id: str) -> dict:
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    images_line = ", ".join(image_names) if image_names else "—"
-    status_line = f"✅ פורסם: {ok}  |  ❌ נכשל: {fail}  |  ⏭ דולג: {skipped}"
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-    text = (
-        f"📊 *דוח פרסום — Cocochoco*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 קמפיין: `{campaign_name}`\n"
-        f"🕐 תאריך: {now}\n"
-        f"{status_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🖼 תמונות: {images_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📝 *טקסט שפורסם:*\n{post_text}"
-    )
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    log("דוח טלגרם נשלח בהצלחה")
-                else:
-                    body = await r.text()
-                    log(f"שגיאה בשליחת טלגרם ({r.status}): {body}", "WARN")
-    except Exception as exc:
-        log(f"שגיאת טלגרם: {exc}", "WARN")
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-def load_config(path: str) -> dict:
-    with open(path) as fh:
-        cfg = json.load(fh)
-    images = []
-    for p in cfg.get("images", []):
-        resolved = Path(p).expanduser()
-        if not resolved.is_absolute():
-            resolved = SCRIPT_DIR / resolved
-        images.append(str(resolved))
-    for img in images:
-        if not os.path.exists(img):
-            log(f"Image not found: {img}", "ERROR")
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        info  = json.loads(sa_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        sa_file = SCRIPT_DIR / "service_account.json"
+        if not sa_file.exists():
+            log("service_account.json לא נמצא ו-GOOGLE_SERVICE_ACCOUNT_JSON לא מוגדר", "ERROR")
             sys.exit(1)
+        creds = Credentials.from_service_account_file(str(sa_file), scopes=SCOPES)
+
+    log(f"Google Sheets: connecting to {sheet_id}…")
+    gc        = gspread.authorize(creds)
+    worksheet = gc.open_by_key(sheet_id).sheet1
+    records   = worksheet.get_all_records()
+
+    active = [r for r in records if str(r.get("active", "")).strip().upper() == "TRUE"]
+    if not active:
+        log("אין קמפיין פעיל ב-Google Sheets (אין שורה עם active=TRUE)", "ERROR")
+        sys.exit(1)
+
+    row = active[0]
+    log(f"קמפיין פעיל: {row.get('campaign_name', '?')}")
+
+    raw_ids   = str(row.get("group_ids", ""))
+    group_ids = [g.strip() for g in raw_ids.replace(",", "|").split("|") if g.strip()]
+
+    if not group_ids:
+        log("לא נמצאו group_ids בשורת הקמפיין", "ERROR")
+        sys.exit(1)
+
     return {
-        "post_text": cfg["post_text"],
-        "images":    images,
-        "group_ids": cfg["group_ids"],
-        "wait":      cfg.get("wait_between_posts_seconds", 25),
+        "campaign_name": str(row.get("campaign_name", "campaign")),
+        "template_text": str(row.get("template_text", "")),
+        "image_folder":  str(row.get("image_url_1", "")),
+        "group_ids":     group_ids,
+        "wait":          int(row.get("wait_seconds", 25) or 25),
     }
 
-def load_templates(path: str) -> dict | None:
-    if not os.path.exists(path):
-        return None
-    with open(path) as fh:
-        return json.load(fh)
+# ─── Cloudinary ───────────────────────────────────────────────────────────────
 
-def load_cookies(path: str) -> list | None:
-    if not os.path.exists(path):
-        return None
-    with open(path) as fh:
-        return json.load(fh)
+def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
+    import cloudinary
+    import cloudinary.api
+
+    cloudinary.config(
+        cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "dhmttntds"),
+        api_key    = os.environ.get("CLOUDINARY_API_KEY"),
+        api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
+    )
+
+    log(f"Cloudinary: listing folder '{folder}'…")
+    result    = cloudinary.api.resources(type="upload", prefix=folder, max_results=100)
+    resources = result.get("resources", [])
+
+    if not resources:
+        log(f"Cloudinary: לא נמצאו תמונות בתיקייה '{folder}'", "ERROR")
+        sys.exit(1)
+
+    selected = random.sample(resources, min(count, len(resources)))
+    tmp_dir  = tempfile.mkdtemp(prefix="fb_images_")
+    paths: list[str] = []
+
+    for res in selected:
+        url  = res["secure_url"]
+        ext  = res.get("format", "jpg")
+        name = res["public_id"].replace("/", "_") + f".{ext}"
+        dest = os.path.join(tmp_dir, name)
+        log(f"  Downloading: {url}")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with open(dest, "wb") as fh:
+            fh.write(resp.content)
+        paths.append(dest)
+
+    log(f"Cloudinary: {len(paths)} image(s) ready")
+    return paths
 
 # ─── Claude API ───────────────────────────────────────────────────────────────
 
-async def generate_post_text(templates_cfg: dict, fallback_text: str) -> str:
+async def generate_post_text(template_text: str) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log("ANTHROPIC_API_KEY not set — using config post_text as-is", "WARN")
-        return fallback_text
-
-    templates = templates_cfg.get("templates", [])
-    if not templates:
-        log("posts_templates.json has no templates — using config post_text", "WARN")
-        return fallback_text
-
-    template = random.choice(templates)
-    log(f"Claude template: {template.get('id', '?')} (tone: {template.get('tone', '?')})")
+        log("ANTHROPIC_API_KEY לא מוגדר — משתמש בטקסט המקורי", "WARN")
+        return template_text + FIXED_CONTACT
 
     try:
         from anthropic import AsyncAnthropic
@@ -175,10 +194,14 @@ async def generate_post_text(templates_cfg: dict, fallback_text: str) -> str:
                 "role": "user",
                 "content": (
                     "Rewrite this Facebook post in Thai with fresh, natural phrasing.\n"
-                    "Keep ALL facts exactly: dates, phone number, Line OA link, "
-                    "academy name, course name, bullet points, and emojis.\n"
+                    "Keep ALL facts exactly: dates, academy name, course name, bullet points, and emojis.\n"
                     "Only vary sentence structure and word choice.\n\n"
-                    f"Original post:\n{template['text']}"
+                    "You MUST include these exact contact details at the end of every post:\n"
+                    "📍 สถานที่: Sivatel Tower, BTS Phlo Chit\n"
+                    "📞 โทร: 092-415-0592\n"
+                    "📲 Line OA: https://lin.ee/mipAAhk\n"
+                    "📝 ลงทะเบียน: https://forms.gle/b78oEZGFbegABH2Y6\n\n"
+                    f"Original post:\n{template_text}"
                 ),
             }],
         )
@@ -188,8 +211,16 @@ async def generate_post_text(templates_cfg: dict, fallback_text: str) -> str:
         return text
 
     except Exception as exc:
-        log(f"Claude API error: {exc} — falling back to config text", "WARN")
-        return fallback_text
+        log(f"Claude API error: {exc} — using original template", "WARN")
+        return template_text + FIXED_CONTACT
+
+# ─── Cookies ──────────────────────────────────────────────────────────────────
+
+def load_cookies(path: str) -> list | None:
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
 
 # ─── Post / fail logs ─────────────────────────────────────────────────────────
 
@@ -211,6 +242,52 @@ def mark_failed(gid: str, reason: str) -> None:
         fh.write(f"{ts}\t{gid}\t{reason}\n")
     log(f"FAILED {gid}: {reason}", "ERROR")
 
+# ─── Telegram report ──────────────────────────────────────────────────────────
+
+async def send_telegram_report(
+    campaign_name: str,
+    ok: int,
+    fail: int,
+    skipped: int,
+    post_text: str,
+    image_names: list[str],
+) -> None:
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        log("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID לא מוגדרים — דיווח מדולג", "WARN")
+        return
+
+    now         = datetime.now().strftime("%d/%m/%Y %H:%M")
+    images_line = ", ".join(image_names) if image_names else "—"
+    status_line = f"✅ פורסם: {ok}  |  ❌ נכשל: {fail}  |  ⏭ דולג: {skipped}"
+
+    text = (
+        f"📊 *דוח פרסום — Cocochoco*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 קמפיין: `{campaign_name}`\n"
+        f"🕐 תאריך: {now}\n"
+        f"{status_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🖼 תמונות: {images_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 *טקסט שפורסם:*\n{post_text}"
+    )
+
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    log("דוח טלגרם נשלח בהצלחה")
+                else:
+                    body = await r.text()
+                    log(f"שגיאה בשליחת טלגרם ({r.status}): {body}", "WARN")
+    except Exception as exc:
+        log(f"שגיאת טלגרם: {exc}", "WARN")
+
 # ─── Group validation ─────────────────────────────────────────────────────────
 
 async def validate_groups(page: Page, group_ids: list[str]) -> tuple[list, list]:
@@ -225,8 +302,8 @@ async def validate_groups(page: Page, group_ids: list[str]) -> tuple[list, list]
             log(f"  ✓ {gid} — {title[:70]}")
         else:
             rejected.append(gid)
-            log(f"  ✗ SKIP {gid} — not hair/beauty: {title[:70]}", "WARN")
-    log(f"Validation done: {len(approved)} approved, {len(rejected)} skipped")
+            log(f"  ✗ SKIP {gid} — {title[:70]}", "WARN")
+    log(f"Validation: {len(approved)} approved, {len(rejected)} skipped")
     return approved, rejected
 
 # ─── Post to one group ────────────────────────────────────────────────────────
@@ -265,7 +342,6 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
         log(f"  Composer trigger: {trigger}")
         await page.wait_for_timeout(3000)
 
-        # Find composer dialog and focus input
         for _ in range(2):
             focus = await page.evaluate("""() => {
                 for (const d of document.querySelectorAll('[role="dialog"]')) {
@@ -343,36 +419,37 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main(
-    config_path:     str,
-    templates_path:  str,
+    sheet_id:        str,
     cookies_path:    str,
     headless:        bool,
     skip_validation: bool,
 ) -> None:
-    cfg           = load_config(config_path)
-    templates_cfg = load_templates(templates_path)
-    cookies       = load_cookies(cookies_path)
+    # 1. Load campaign from Google Sheets
+    campaign = load_campaign_from_sheets(sheet_id)
+
+    # 2. Download images from Cloudinary
+    images = download_cloudinary_images(campaign["image_folder"], count=3)
+
+    # 3. Load Facebook cookies
+    cookies = load_cookies(cookies_path)
 
     log("=" * 60)
-    log("Cocochoco — Facebook Groups Poster v3 (Playwright)")
-    log(f"Config:          {config_path}")
-    log(f"Templates:       {templates_path} ({'loaded' if templates_cfg else 'not found — using raw text'})")
+    log("Cocochoco — Facebook Groups Poster v4 (Sheets + Cloudinary)")
+    log(f"Campaign:        {campaign['campaign_name']}")
+    log(f"Groups:          {len(campaign['group_ids'])}")
+    log(f"Images:          {len(images)}")
     log(f"Cookies:         {cookies_path} ({'loaded' if cookies else 'NOT FOUND'})")
-    log(f"Groups:          {len(cfg['group_ids'])}")
-    log(f"Images:          {len(cfg['images'])}")
     log(f"Headless mode:   {headless}")
     log(f"Skip validation: {skip_validation}")
     log("=" * 60)
 
     if not cookies:
         log("fb_cookies.json לא נמצא!", "ERROR")
-        log("הרץ: python3 fb_export_cookies.py — ואז העלה מחדש ל-Railway", "ERROR")
+        log("הרץ: python3 fb_export_cookies.py", "ERROR")
         sys.exit(1)
 
-    if templates_cfg:
-        post_text = await generate_post_text(templates_cfg, cfg["post_text"])
-    else:
-        post_text = cfg["post_text"]
+    # 4. Generate post text via Claude
+    post_text = await generate_post_text(campaign["template_text"])
     log(f"Post preview: {post_text[:100].strip()}…")
 
     for f in [POSTED_LOG, FAILED_LOG]:
@@ -399,17 +476,16 @@ async def main(
             await page.goto("https://www.facebook.com", wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
 
-            cur_url = page.url
-            if "login" in cur_url or "checkpoint" in cur_url:
+            if "login" in page.url or "checkpoint" in page.url:
                 log("NOT LOGGED IN — cookies פגו תוקף!", "ERROR")
-                log("הרץ fb_export_cookies.py מקומית ועדכן את fb_cookies.json ב-Railway", "ERROR")
+                log("הרץ fb_export_cookies.py ועדכן את fb_cookies.json", "ERROR")
                 await browser.close()
                 return
 
             log("Logged in ✓")
             await page.wait_for_timeout(2000)
 
-            group_ids = cfg["group_ids"]
+            group_ids = campaign["group_ids"]
             if not skip_validation:
                 group_ids, _ = await validate_groups(page, group_ids)
 
@@ -424,7 +500,7 @@ async def main(
                     skipped += 1
                     continue
 
-                success = await post_to_group(page, gid, cfg["images"], post_text)
+                success = await post_to_group(page, gid, images, post_text)
                 if success:
                     ok += 1
                     posted.add(gid)
@@ -432,8 +508,8 @@ async def main(
                     fail += 1
 
                 if i < total:
-                    log(f"  Waiting {cfg['wait']}s…")
-                    await page.wait_for_timeout(cfg["wait"] * 1000)
+                    log(f"  Waiting {campaign['wait']}s…")
+                    await page.wait_for_timeout(campaign["wait"] * 1000)
 
             log("=" * 60)
             log(f"Run complete — ✅ posted: {ok} | ❌ failed: {fail} | ⏭ skipped: {skipped}")
@@ -443,10 +519,9 @@ async def main(
                     for line in fh:
                         log(f"  {line.strip()}", "ERROR")
 
-            campaign_name = Path(config_path).stem
-            image_names   = [Path(p).name for p in cfg["images"]]
+            image_names = [Path(p).name for p in images]
             await send_telegram_report(
-                campaign_name=campaign_name,
+                campaign_name=campaign["campaign_name"],
                 ok=ok,
                 fail=fail,
                 skipped=skipped,
@@ -461,17 +536,15 @@ async def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Cocochoco Facebook Groups Poster v3")
-    parser.add_argument("--config",          default=str(DEFAULT_CONFIG))
-    parser.add_argument("--templates",       default=str(DEFAULT_TEMPLATES))
+    parser = argparse.ArgumentParser(description="Cocochoco Facebook Groups Poster v4")
+    parser.add_argument("--sheet-id",        default=os.environ.get("GOOGLE_SHEET_ID", DEFAULT_SHEET))
     parser.add_argument("--cookies",         default=str(DEFAULT_COOKIES))
     parser.add_argument("--no-headless",     action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     args = parser.parse_args()
 
     asyncio.run(main(
-        config_path     = args.config,
-        templates_path  = args.templates,
+        sheet_id        = args.sheet_id,
         cookies_path    = args.cookies,
         headless        = not args.no_headless,
         skip_validation = args.skip_validation,
