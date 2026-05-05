@@ -115,8 +115,11 @@ def load_campaign_from_sheets(sheet_id: str) -> dict:
     row = active[0]
     log(f"קמפיין פעיל: {row.get('campaign_name', '?')}")
 
-    raw_ids   = str(row.get("group_ids", ""))
-    group_ids = [g.strip() for g in raw_ids.replace(",", "|").split("|") if g.strip()]
+    raw_ids = str(row.get("group_ids", ""))
+    log(f"group_ids raw value: {repr(raw_ids)}")
+    # support |, comma, newline, and whitespace as separators
+    import re
+    group_ids = [g.strip() for g in re.split(r"[|,\n\r\s]+", raw_ids) if g.strip()]
 
     if not group_ids:
         log("לא נמצאו group_ids בשורת הקמפיין", "ERROR")
