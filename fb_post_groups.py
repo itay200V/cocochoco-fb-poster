@@ -235,6 +235,12 @@ def load_cookies(path: str) -> list | None:
 
     return None
 
+
+def sanitize_cookies(cookies: list) -> list:
+    """Keep only fields Playwright's add_cookies accepts."""
+    allowed = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+    return [{k: v for k, v in c.items() if k in allowed} for c in cookies]
+
 # ─── Post / fail logs ─────────────────────────────────────────────────────────
 
 def load_posted() -> set:
@@ -481,7 +487,7 @@ async def main(
             ],
         )
         context = await browser.new_context(viewport={"width": 1280, "height": 900})
-        await context.add_cookies(cookies)
+        await context.add_cookies(sanitize_cookies(cookies))
         page = await context.new_page()
 
         try:
