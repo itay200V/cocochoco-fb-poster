@@ -263,6 +263,11 @@ def mark_failed(gid: str, reason: str) -> None:
 
 # ─── Telegram report ──────────────────────────────────────────────────────────
 
+def _esc(s: str) -> str:
+    """Escape special HTML characters for Telegram HTML parse mode."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 async def send_telegram_report(
     campaign_name: str,
     ok: int,
@@ -278,23 +283,23 @@ async def send_telegram_report(
         return
 
     now         = datetime.now().strftime("%d/%m/%Y %H:%M")
-    images_line = ", ".join(image_names) if image_names else "—"
+    images_line = _esc(", ".join(image_names) if image_names else "—")
     status_line = f"✅ פורסם: {ok}  |  ❌ נכשל: {fail}  |  ⏭ דולג: {skipped}"
 
     text = (
-        f"📊 *דוח פרסום — Cocochoco*\n"
+        f"📊 <b>דוח פרסום — Cocochoco</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 קמפיין: `{campaign_name}`\n"
+        f"🎯 קמפיין: <code>{_esc(campaign_name)}</code>\n"
         f"🕐 תאריך: {now}\n"
         f"{status_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🖼 תמונות: {images_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📝 *טקסט שפורסם:*\n{post_text}"
+        f"📝 <b>טקסט שפורסם:</b>\n{_esc(post_text)}"
     )
 
     url     = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
 
     try:
         async with aiohttp.ClientSession() as s:
