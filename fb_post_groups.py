@@ -217,10 +217,20 @@ async def generate_post_text(template_text: str) -> str:
 # ─── Cookies ──────────────────────────────────────────────────────────────────
 
 def load_cookies(path: str) -> list | None:
-    if not os.path.exists(path):
-        return None
-    with open(path) as fh:
-        return json.load(fh)
+    if os.path.exists(path):
+        with open(path) as fh:
+            return json.load(fh)
+
+    env_json = os.environ.get("FB_COOKIES_JSON")
+    if env_json:
+        cookies = json.loads(env_json)
+        tmp_path = os.path.join(tempfile.gettempdir(), "fb_cookies.json")
+        with open(tmp_path, "w") as fh:
+            json.dump(cookies, fh)
+        log(f"FB_COOKIES_JSON loaded from env → saved to {tmp_path}")
+        return cookies
+
+    return None
 
 # ─── Post / fail logs ─────────────────────────────────────────────────────────
 
