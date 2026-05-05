@@ -359,7 +359,7 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
             mark_failed(group_id, "Write-something button not found (not a member or posting disabled)")
             return False
         log(f"  Composer trigger: {trigger}")
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(8000)
 
         for _ in range(2):
             focus = await page.evaluate("""() => {
@@ -373,7 +373,7 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
             }""")
             if focus == "focused":
                 break
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(8000)
 
         if focus != "focused":
             mark_failed(group_id, f"Focus failed: {focus}")
