@@ -172,6 +172,17 @@ def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
     log(f"Cloudinary: {len(paths)} image(s) ready")
     return paths
 
+# ─── Prompt Guidelines ────────────────────────────────────────────────────────
+
+def load_prompt_guidelines() -> str:
+    guidelines_path = SCRIPT_DIR / "prompt_guidelines.md"
+    if guidelines_path.exists():
+        text = guidelines_path.read_text(encoding="utf-8")
+        log(f"Loaded prompt_guidelines.md ({len(text)} chars)")
+        return text
+    log("prompt_guidelines.md not found — using built-in defaults", "WARN")
+    return ""
+
 # ─── Claude API ───────────────────────────────────────────────────────────────
 
 async def generate_post_text(template_text: str) -> str:
@@ -179,6 +190,9 @@ async def generate_post_text(template_text: str) -> str:
     if not api_key:
         log("ANTHROPIC_API_KEY לא מוגדר — משתמש בטקסט המקורי", "WARN")
         return template_text + FIXED_CONTACT
+
+    guidelines = load_prompt_guidelines()
+    guidelines_section = f"\n\n---\nPOST GUIDELINES (follow strictly):\n{guidelines}" if guidelines else ""
 
     try:
         from anthropic import AsyncAnthropic
@@ -192,6 +206,7 @@ async def generate_post_text(template_text: str) -> str:
                 "a professional keratin treatment and hair styling school. "
                 "Write natural, warm Facebook group posts in Thai. "
                 "Output ONLY the post text — no labels, no explanations, no English."
+                + guidelines_section
             ),
             messages=[{
                 "role": "user",
@@ -199,11 +214,6 @@ async def generate_post_text(template_text: str) -> str:
                     "Rewrite this Facebook post in Thai with fresh, natural phrasing.\n"
                     "Keep ALL facts exactly: dates, academy name, course name, bullet points, and emojis.\n"
                     "Only vary sentence structure and word choice.\n\n"
-                    "You MUST include these exact contact details at the end of every post:\n"
-                    "📍 สถานที่: Sivatel Tower, BTS Phlo Chit\n"
-                    "📞 โทร: 092-415-0592\n"
-                    "📲 Line OA: https://lin.ee/mipAAhk\n"
-                    "📝 ลงทะเบียน: https://forms.gle/b78oEZGFbegABH2Y6\n\n"
                     f"Original post:\n{template_text}"
                 ),
             }],
@@ -311,6 +321,55 @@ async def send_telegram_report(
                     log(f"שגיאה בשליחת טלגרם ({r.status}): {body}", "WARN")
     except Exception as exc:
         log(f"שגיאת טלגרם: {exc}", "WARN")
+
+
+async def send_telegram_photos(image_paths: list[str]) -> None:
+    """Send actual image files to Telegram via sendPhoto / sendMediaGroup."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    if not image_paths:
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            if len(image_paths) == 1:
+                # Single photo — use sendPhoto
+                path = image_paths[0]
+                url  = f"https://api.telegram.org/bot{token}/sendPhoto"
+                with open(path, "rb") as fh:
+                    data = aiohttp.FormData()
+                    data.add_field("chat_id", chat_id)
+                    data.add_field("photo", fh, filename=Path(path).name, content_type="image/jpeg")
+                    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        if r.status == 200:
+                            log(f"תמונה נשלחה לטלגרם: {Path(path).name}")
+                        else:
+                            body = await r.text()
+                            log(f"שגיאה בשליחת תמונה ({r.status}): {body}", "WARN")
+            else:
+                # Multiple photos — use sendMediaGroup
+                url   = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+                media = [{"type": "photo", "media": f"attach://photo{i}"} for i in range(len(image_paths))]
+                data  = aiohttp.FormData()
+                data.add_field("chat_id", chat_id)
+                data.add_field("media", json.dumps(media))
+                for i, path in enumerate(image_paths):
+                    with open(path, "rb") as fh:
+                        data.add_field(
+                            f"photo{i}", fh.read(),
+                            filename=Path(path).name,
+                            content_type="image/jpeg",
+                        )
+                async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status == 200:
+                        log(f"{len(image_paths)} תמונות נשלחו לטלגרם")
+                    else:
+                        body = await r.text()
+                        log(f"שגיאה בשליחת תמונות ({r.status}): {body}", "WARN")
+    except Exception as exc:
+        log(f"שגיאת שליחת תמונות לטלגרם: {exc}", "WARN")
 
 # ─── Group validation ─────────────────────────────────────────────────────────
 
@@ -552,6 +611,7 @@ async def main(
                 post_text=post_text,
                 image_names=image_names,
             )
+            await send_telegram_photos(images)
 
         finally:
             await browser.close()
