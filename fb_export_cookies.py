@@ -58,8 +58,11 @@ def decrypt_value(encrypted: bytes, key: bytes) -> str:
     dec    = cipher.decryptor()
     raw    = dec.update(data) + dec.finalize()
     # remove PKCS7 padding
-    pad = raw[-1]
-    return raw[:-pad].decode("utf-8", errors="replace")
+    pad = raw[-1] if raw and 1 <= raw[-1] <= 16 else 0
+    # Chrome adds a 32-byte internal prefix to the plaintext — strip it
+    start = 32
+    end   = len(raw) - pad if pad else len(raw)
+    return raw[start:end].decode("utf-8", errors="replace")
 
 
 def main() -> None:
