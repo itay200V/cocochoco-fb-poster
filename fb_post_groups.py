@@ -172,16 +172,19 @@ def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
     log(f"Cloudinary: {len(paths)} image(s) ready")
     return paths
 
-# ─── Prompt Guidelines ────────────────────────────────────────────────────────
+# ─── System Guidelines ────────────────────────────────────────────────────────
 
-def load_prompt_guidelines() -> str:
-    guidelines_path = SCRIPT_DIR / "prompt_guidelines.md"
-    if guidelines_path.exists():
-        text = guidelines_path.read_text(encoding="utf-8")
-        log(f"Loaded prompt_guidelines.md ({len(text)} chars)")
-        return text
-    log("prompt_guidelines.md not found — using built-in defaults", "WARN")
-    return ""
+def load_system_guidelines() -> str:
+    """Load brand_guidelines.md then campaign_active.md as a combined system prompt."""
+    parts = []
+    for filename in ("brand_guidelines.md", "campaign_active.md"):
+        path = SCRIPT_DIR / filename
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8"))
+            log(f"Loaded {filename} ({len(parts[-1])} chars)")
+        else:
+            log(f"{filename} not found — skipping", "WARN")
+    return "\n\n---\n\n".join(parts)
 
 # ─── Claude API ───────────────────────────────────────────────────────────────
 
@@ -191,30 +194,29 @@ async def generate_post_text(template_text: str) -> str:
         log("ANTHROPIC_API_KEY לא מוגדר — משתמש בטקסט המקורי", "WARN")
         return template_text + FIXED_CONTACT
 
-    guidelines = load_prompt_guidelines()
-    guidelines_section = f"\n\n---\nPOST GUIDELINES (follow strictly):\n{guidelines}" if guidelines else ""
+    guidelines = load_system_guidelines()
 
     try:
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=api_key)
 
+        system_prompt = guidelines if guidelines else (
+            "You are a Thai social media copywriter for COCOCHOCO Academy Bangkok. "
+            "Write natural, warm Facebook group posts in Thai for professional hairstylists. "
+            "Output ONLY the post text — no labels, no explanations."
+        )
+
         msg = await client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
-            system=(
-                "You are a Thai social media copywriter for COCOCHOCO Academy Bangkok, "
-                "a professional keratin treatment and hair styling school. "
-                "Write natural, warm Facebook group posts in Thai. "
-                "Output ONLY the post text — no labels, no explanations, no English."
-                + guidelines_section
-            ),
+            system=system_prompt,
             messages=[{
                 "role": "user",
                 "content": (
-                    "Rewrite this Facebook post in Thai with fresh, natural phrasing.\n"
-                    "Keep ALL facts exactly: dates, academy name, course name, bullet points, and emojis.\n"
-                    "Only vary sentence structure and word choice.\n\n"
-                    f"Original post:\n{template_text}"
+                    "Write a Facebook group post based on the campaign details above.\n"
+                    "Follow ALL brand and campaign rules strictly.\n"
+                    "Output ONLY the post text — no labels, no explanations.\n\n"
+                    f"Campaign template / additional notes:\n{template_text}"
                 ),
             }],
         )
