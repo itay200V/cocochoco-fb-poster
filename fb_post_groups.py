@@ -143,7 +143,7 @@ def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
     )
 
     log(f"Cloudinary: listing folder '{folder}'…")
-    result    = cloudinary.api.resources(type="upload", prefix=folder, max_results=100)
+  result = cloudinary.api.resources(type="upload", folder=folder, max_results=100)
     resources = result.get("resources", [])
 
     if not resources:
