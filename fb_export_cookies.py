@@ -2,84 +2,119 @@
 """
 fb_export_cookies.py
 ====================
-מייצא את ה-cookies של פייסבוק מ-Chrome הפתוח ושומר ל-fb_cookies.json.
+קורא cookies של פייסבוק ישירות מקובץ הפרופיל של Chrome בדיסק.
+לא דורש שChrome יהיה פתוח.
 
-דרישות מוקדמות:
-  Chrome פתוח עם: --remote-debugging-port=9222
-  ומחובר לפייסבוק.
+דרישות:
+  pip3 install cryptography
 
 הרצה:
   python3 fb_export_cookies.py
 """
-import asyncio
+import hashlib
 import json
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
-import aiohttp
-import websockets
+OUT_FILE     = Path(__file__).parent / "fb_cookies.json"
+COOKIES_DB   = Path.home() / "Library/Application Support/Google/Chrome/Profile 2/Cookies"
+SAMESITE_MAP = {-1: None, 0: "None", 1: "Lax", 2: "Strict"}
 
-CDP_URL  = "http://localhost:9222"
-OUT_FILE = Path(__file__).parent / "fb_cookies.json"
+# Chrome epoch starts at Jan 1, 1601 — convert to Unix timestamp
+CHROME_EPOCH_OFFSET = 11644473600
 
 
-async def main() -> None:
-    print("מתחבר ל-Chrome CDP…")
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{CDP_URL}/json") as r:
-            tabs = await r.json()
+def get_encryption_key() -> bytes:
+    """Fetch Chrome's AES key from macOS Keychain and derive it via PBKDF2."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-w", "-s", "Chrome Safe Storage", "-a", "Chrome"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"שגיאה בקריאת Keychain: {result.stderr.strip()}")
+        sys.exit(1)
+    password = result.stdout.strip().encode()
+    return hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, dklen=16)
 
-    page = next((t for t in tabs if t.get("type") == "page"), None)
-    if not page:
-        print("שגיאה: לא נמצאה כרטיסייה פתוחה ב-Chrome.")
-        print("פתח Chrome עם: --remote-debugging-port=9222")
-        return
 
-    print(f"כרטיסייה: {page.get('title', '?')}")
-    ws_url = page["webSocketDebuggerUrl"]
+def decrypt_value(encrypted: bytes, key: bytes) -> str:
+    """Decrypt a Chrome cookie value (v10 AES-CBC)."""
+    if not encrypted:
+        return ""
+    if not encrypted.startswith(b"v10"):
+        # unencrypted (rare)
+        return encrypted.decode("utf-8", errors="replace")
 
-    async with websockets.connect(ws_url, max_size=10 * 1024 * 1024) as ws:
-        # Enable Network domain
-        await ws.send(json.dumps({"id": 1, "method": "Network.enable", "params": {}}))
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
 
-        # Request all cookies
-        await ws.send(json.dumps({"id": 2, "method": "Network.getAllCookies", "params": {}}))
+    iv   = b" " * 16
+    data = encrypted[3:]  # strip 'v10' prefix
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    dec    = cipher.decryptor()
+    raw    = dec.update(data) + dec.finalize()
+    # remove PKCS7 padding
+    pad = raw[-1]
+    return raw[:-pad].decode("utf-8", errors="replace")
 
-        # Collect both responses
-        results: dict[int, dict] = {}
-        while len(results) < 2:
-            raw  = await asyncio.wait_for(ws.recv(), timeout=10)
-            data = json.loads(raw)
-            if "id" in data and data["id"] in (1, 2):
-                results[data["id"]] = data
 
-    all_cookies = results[2].get("result", {}).get("cookies", [])
-    fb_cookies  = [c for c in all_cookies if "facebook.com" in c.get("domain", "")]
+def main() -> None:
+    if not COOKIES_DB.exists():
+        print(f"שגיאה: קובץ Cookies לא נמצא ב-{COOKIES_DB}")
+        print("בדוק שהנתיב נכון — אולי הפרופיל שלך הוא 'Default' ולא 'Profile 2'")
+        sys.exit(1)
 
-    # Keep only fields that Playwright's add_cookies() accepts
+    print(f"קורא cookies מ-{COOKIES_DB}")
+    key = get_encryption_key()
+
+    # Copy DB to temp (Chrome may lock it)
+    tmp_db = tempfile.mktemp(suffix=".db")
+    shutil.copy2(COOKIES_DB, tmp_db)
+
+    con = sqlite3.connect(tmp_db)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT host_key, name, encrypted_value, value, path, "
+        "expires_utc, is_secure, is_httponly, samesite "
+        "FROM cookies WHERE host_key LIKE '%facebook.com'"
+    ).fetchall()
+    con.close()
+
+    print(f"נמצאו {len(rows)} cookies של פייסבוק")
+
     clean = []
-    for c in fb_cookies:
+    for row in rows:
+        raw_value = row["value"] or ""
+        if row["encrypted_value"]:
+            raw_value = decrypt_value(bytes(row["encrypted_value"]), key)
+
+        expires_utc = row["expires_utc"]
+        expires_unix = (expires_utc / 1_000_000 - CHROME_EPOCH_OFFSET) if expires_utc else -1
+
+        samesite_int = row["samesite"] if row["samesite"] is not None else -1
+        samesite_str = SAMESITE_MAP.get(samesite_int)
+
         entry: dict = {
-            "name":     c["name"],
-            "value":    c["value"],
-            "domain":   c["domain"],
-            "path":     c["path"],
-            "httpOnly": c.get("httpOnly", False),
-            "secure":   c.get("secure", False),
+            "name":     row["name"],
+            "value":    raw_value,
+            "domain":   row["host_key"],
+            "path":     row["path"],
+            "httpOnly": bool(row["is_httponly"]),
+            "secure":   bool(row["is_secure"]),
         }
-        if c.get("expires", -1) > 0:
-            entry["expires"] = c["expires"]
-        if c.get("sameSite") in ("None", "Lax", "Strict"):
-            entry["sameSite"] = c["sameSite"]
+        if expires_unix > 0:
+            entry["expires"] = expires_unix
+        if samesite_str in ("None", "Lax", "Strict"):
+            entry["sameSite"] = samesite_str
         clean.append(entry)
 
     OUT_FILE.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
-    print(f"✅ {len(clean)} Facebook cookies נשמרו ל-{OUT_FILE}")
-    print()
-    print("השלבים הבאים:")
-    print("  1. העלה את fb_cookies.json ל-Railway כ-Secret File (ב-Variables → Files)")
-    print("     נתיב: /app/fb_cookies.json")
-    print("  2. פרס מחדש את השירות")
+    print(f"✅ {len(clean)} cookies נשמרו ל-{OUT_FILE}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
