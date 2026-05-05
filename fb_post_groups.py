@@ -4,10 +4,10 @@ Cocochoco — Facebook Groups Poster v4 (Google Sheets + Cloudinary)
 ===================================================================
 Data flow:
   1. Read active campaign (active=TRUE) from Google Sheets
-  2. Download 2-3 random images from Cloudinary folder (image_url_1 column)
+  2. Download image pool from Cloudinary folder (image_url_1 column)
   3. Generate Thai Facebook post via Claude API from template_text
-  4. Post to all Facebook groups in the campaign row
-  5. Send Telegram run report
+  4. Post to all Facebook groups — each group gets its own random image set
+  5. Send Telegram run report + actual images
 
 Google Sheets expected columns:
   active          TRUE / FALSE
@@ -15,7 +15,7 @@ Google Sheets expected columns:
   template_text   base text sent to Claude for rewriting
   image_url_1     Cloudinary folder path  (e.g. "cocochoco/open_house")
   group_ids       pipe-separated FB group IDs  (e.g. "123|456|789")
-  wait_seconds    seconds between posts (optional, default 25)
+  wait_seconds    seconds between posts (optional, default 15)
 
 ENV VARS:
   ANTHROPIC_API_KEY            Claude API key
@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import random
 import sys
 import tempfile
@@ -59,6 +60,15 @@ FIXED_CONTACT = (
     "\n📞 โทร: 092-415-0592"
     "\n📲 Line OA: https://lin.ee/mipAAhk"
     "\n📝 ลงทะเบียน: https://forms.gle/b78oEZGFbegABH2Y6"
+)
+
+# Failure reasons that must NOT trigger a retry
+PERMANENT_REASONS = (
+    "posting disabled",
+    "not a member",
+    "Write-something button not found",
+    "Redirected to login",
+    "cookies expired",
 )
 
 _TMP       = tempfile.gettempdir()
@@ -115,10 +125,7 @@ def load_campaign_from_sheets(sheet_id: str) -> dict:
     row = active[0]
     log(f"קמפיין פעיל: {row.get('campaign_name', '?')}")
 
-    raw_ids = str(row.get("group_ids", ""))
-    log(f"group_ids raw value: {repr(raw_ids)}")
-    # support |, comma, newline, and whitespace as separators
-    import re
+    raw_ids   = str(row.get("group_ids", ""))
     group_ids = [g.strip() for g in re.split(r"[|,\n\r\s]+", raw_ids) if g.strip()]
 
     if not group_ids:
@@ -130,12 +137,13 @@ def load_campaign_from_sheets(sheet_id: str) -> dict:
         "template_text": str(row.get("template_text", "")),
         "image_folder":  str(row.get("image_url_1", "")),
         "group_ids":     group_ids,
-        "wait":          int(row.get("wait_seconds", 25) or 25),
+        "wait":          int(row.get("wait_seconds", 15) or 15),
     }
 
 # ─── Cloudinary ───────────────────────────────────────────────────────────────
 
-def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
+def download_cloudinary_images(folder: str, count: int = 8) -> list[str]:
+    """Download a pool of images; each group will sample its own subset."""
     import cloudinary
     import cloudinary.api
 
@@ -146,7 +154,7 @@ def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
     )
 
     log(f"Cloudinary: listing folder '{folder}'…")
-    result = cloudinary.api.resources(type="upload", folder=folder, max_results=100)
+    result    = cloudinary.api.resources(type="upload", folder=folder, max_results=100)
     resources = result.get("resources", [])
 
     if not resources:
@@ -169,7 +177,7 @@ def download_cloudinary_images(folder: str, count: int = 3) -> list[str]:
             fh.write(resp.content)
         paths.append(dest)
 
-    log(f"Cloudinary: {len(paths)} image(s) ready")
+    log(f"Cloudinary: {len(paths)} image(s) in pool")
     return paths
 
 # ─── System Guidelines ────────────────────────────────────────────────────────
@@ -208,7 +216,7 @@ async def generate_post_text(template_text: str) -> str:
 
         msg = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
+            max_tokens=512,
             system=system_prompt,
             messages=[{
                 "role": "user",
@@ -249,9 +257,19 @@ def load_cookies(path: str) -> list | None:
 
 
 def sanitize_cookies(cookies: list) -> list:
-    """Keep only fields Playwright's add_cookies accepts."""
     allowed = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
     return [{k: v for k, v in c.items() if k in allowed} for c in cookies]
+
+
+def expiring_cookies(cookies: list, days: int = 3) -> list[str]:
+    """Return names of cookies expiring within `days` days."""
+    now       = datetime.now().timestamp()
+    threshold = days * 24 * 3600
+    return [
+        c.get("name", "?")
+        for c in cookies
+        if 0 < c.get("expires", -1) - now < threshold
+    ]
 
 # ─── Post / fail logs ─────────────────────────────────────────────────────────
 
@@ -273,11 +291,34 @@ def mark_failed(gid: str, reason: str) -> None:
         fh.write(f"{ts}\t{gid}\t{reason}\n")
     log(f"FAILED {gid}: {reason}", "ERROR")
 
-# ─── Telegram report ──────────────────────────────────────────────────────────
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
 def _esc(s: str) -> str:
-    """Escape special HTML characters for Telegram HTML parse mode."""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _tg_post(session: aiohttp.ClientSession, token: str, method: str, **kwargs) -> bool:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        async with session.post(url, timeout=aiohttp.ClientTimeout(total=30), **kwargs) as r:
+            if r.status == 200:
+                return True
+            body = await r.text()
+            log(f"Telegram {method} error ({r.status}): {body}", "WARN")
+            return False
+    except Exception as exc:
+        log(f"Telegram {method} exception: {exc}", "WARN")
+        return False
+
+
+async def send_telegram_alert(message: str) -> None:
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    async with aiohttp.ClientSession() as s:
+        await _tg_post(s, token, "sendMessage",
+                       json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"})
 
 
 async def send_telegram_report(
@@ -310,68 +351,38 @@ async def send_telegram_report(
         f"📝 <b>טקסט שפורסם:</b>\n{_esc(post_text)}"
     )
 
-    url     = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    log("דוח טלגרם נשלח בהצלחה")
-                else:
-                    body = await r.text()
-                    log(f"שגיאה בשליחת טלגרם ({r.status}): {body}", "WARN")
-    except Exception as exc:
-        log(f"שגיאת טלגרם: {exc}", "WARN")
+    async with aiohttp.ClientSession() as s:
+        await _tg_post(s, token, "sendMessage",
+                       json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+        log("דוח טלגרם נשלח")
 
 
 async def send_telegram_photos(image_paths: list[str]) -> None:
-    """Send actual image files to Telegram via sendPhoto / sendMediaGroup."""
     token   = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
-    if not image_paths:
+    if not token or not chat_id or not image_paths:
         return
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            if len(image_paths) == 1:
-                # Single photo — use sendPhoto
-                path = image_paths[0]
-                url  = f"https://api.telegram.org/bot{token}/sendPhoto"
-                with open(path, "rb") as fh:
-                    data = aiohttp.FormData()
-                    data.add_field("chat_id", chat_id)
-                    data.add_field("photo", fh, filename=Path(path).name, content_type="image/jpeg")
-                    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                        if r.status == 200:
-                            log(f"תמונה נשלחה לטלגרם: {Path(path).name}")
-                        else:
-                            body = await r.text()
-                            log(f"שגיאה בשליחת תמונה ({r.status}): {body}", "WARN")
-            else:
-                # Multiple photos — use sendMediaGroup
-                url   = f"https://api.telegram.org/bot{token}/sendMediaGroup"
-                media = [{"type": "photo", "media": f"attach://photo{i}"} for i in range(len(image_paths))]
-                data  = aiohttp.FormData()
+    async with aiohttp.ClientSession() as session:
+        if len(image_paths) == 1:
+            path = image_paths[0]
+            with open(path, "rb") as fh:
+                data = aiohttp.FormData()
                 data.add_field("chat_id", chat_id)
-                data.add_field("media", json.dumps(media))
-                for i, path in enumerate(image_paths):
-                    with open(path, "rb") as fh:
-                        data.add_field(
-                            f"photo{i}", fh.read(),
-                            filename=Path(path).name,
-                            content_type="image/jpeg",
-                        )
-                async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=60)) as r:
-                    if r.status == 200:
-                        log(f"{len(image_paths)} תמונות נשלחו לטלגרם")
-                    else:
-                        body = await r.text()
-                        log(f"שגיאה בשליחת תמונות ({r.status}): {body}", "WARN")
-    except Exception as exc:
-        log(f"שגיאת שליחת תמונות לטלגרם: {exc}", "WARN")
+                data.add_field("photo", fh, filename=Path(path).name, content_type="image/jpeg")
+                await _tg_post(session, token, "sendPhoto", data=data)
+                log(f"תמונה נשלחה לטלגרם: {Path(path).name}")
+        else:
+            media = [{"type": "photo", "media": f"attach://photo{i}"} for i in range(len(image_paths))]
+            data  = aiohttp.FormData()
+            data.add_field("chat_id", chat_id)
+            data.add_field("media", json.dumps(media))
+            for i, path in enumerate(image_paths):
+                with open(path, "rb") as fh:
+                    data.add_field(f"photo{i}", fh.read(),
+                                   filename=Path(path).name, content_type="image/jpeg")
+            await _tg_post(session, token, "sendMediaGroup", data=data)
+            log(f"{len(image_paths)} תמונות נשלחו לטלגרם")
 
 # ─── Group validation ─────────────────────────────────────────────────────────
 
@@ -393,7 +404,14 @@ async def validate_groups(page: Page, group_ids: list[str]) -> tuple[list, list]
 
 # ─── Post to one group ────────────────────────────────────────────────────────
 
-async def post_to_group(page: Page, group_id: str, images: list[str], post_text: str) -> bool:
+async def post_to_group(
+    page: Page, group_id: str, images: list[str], post_text: str
+) -> tuple[bool, bool]:
+    """
+    Returns (success, retryable).
+    success=True means posted OK.
+    retryable=False means a permanent failure — do not retry.
+    """
     url = f"https://www.facebook.com/groups/{group_id}"
     log(f"  → {url}")
     try:
@@ -405,8 +423,7 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
         log(f"  Page: {title}")
 
         if "login" in cur_url or "checkpoint" in cur_url:
-            mark_failed(group_id, "Redirected to login — cookies expired")
-            return False
+            return False, False  # permanent — cookies expired
 
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(500)
@@ -422,8 +439,8 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
         }""")
 
         if not trigger or "not-found" in str(trigger):
-            mark_failed(group_id, "Write-something button not found (not a member or posting disabled)")
-            return False
+            return False, False  # permanent — not a member or posting disabled
+
         log(f"  Composer trigger: {trigger}")
         await page.wait_for_timeout(8000)
 
@@ -442,8 +459,7 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
             await page.wait_for_timeout(8000)
 
         if focus != "focused":
-            mark_failed(group_id, f"Focus failed: {focus}")
-            return False
+            return False, True  # transient — dialog didn't open in time
 
         await page.wait_for_timeout(300)
         await page.keyboard.type(post_text, delay=10)
@@ -489,17 +505,18 @@ async def post_to_group(page: Page, group_id: str, images: list[str], post_text:
         }""")
 
         log(f"  Post button: {post_result}")
-        if any(x in str(post_result) for x in ["no-composer", "disabled"]):
-            mark_failed(group_id, f"Post button issue: {post_result}")
-            return False
+        if "post-disabled" in str(post_result):
+            return False, False  # permanent — posting disabled
+        if "no-composer" in str(post_result):
+            return False, True   # transient — composer disappeared
 
         await page.wait_for_timeout(8000)
         mark_posted(group_id)
-        return True
+        return True, False
 
     except Exception as exc:
-        mark_failed(group_id, str(exc)[:150])
-        return False
+        log(f"  Exception: {exc}", "WARN")
+        return False, True  # transient — playwright / network error
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -509,20 +526,15 @@ async def main(
     headless:        bool,
     skip_validation: bool,
 ) -> None:
-    # 1. Load campaign from Google Sheets
     campaign = load_campaign_from_sheets(sheet_id)
-
-    # 2. Download images from Cloudinary
-    images = download_cloudinary_images(campaign["image_folder"], count=3)
-
-    # 3. Load Facebook cookies
-    cookies = load_cookies(cookies_path)
+    image_pool = download_cloudinary_images(campaign["image_folder"], count=8)
+    cookies    = load_cookies(cookies_path)
 
     log("=" * 60)
     log("Cocochoco — Facebook Groups Poster v4 (Sheets + Cloudinary)")
     log(f"Campaign:        {campaign['campaign_name']}")
     log(f"Groups:          {len(campaign['group_ids'])}")
-    log(f"Images:          {len(images)}")
+    log(f"Image pool:      {len(image_pool)}")
     log(f"Cookies:         {cookies_path} ({'loaded' if cookies else 'NOT FOUND'})")
     log(f"Headless mode:   {headless}")
     log(f"Skip validation: {skip_validation}")
@@ -533,7 +545,18 @@ async def main(
         log("הרץ: python3 fb_export_cookies.py", "ERROR")
         sys.exit(1)
 
-    # 4. Generate post text via Claude
+    # Proactive cookie expiry warning
+    expiring = expiring_cookies(cookies, days=3)
+    if expiring:
+        msg = (
+            f"⚠️ <b>אזהרה — Cocochoco Bot</b>\n"
+            f"הcookies הבאים פגים תוך 3 ימים:\n"
+            f"<code>{', '.join(expiring)}</code>\n"
+            f"יש לחדש את fb_cookies.json בהקדם."
+        )
+        await send_telegram_alert(msg)
+        log(f"Cookie expiry warning sent: {expiring}", "WARN")
+
     post_text = await generate_post_text(campaign["template_text"])
     log(f"Post preview: {post_text[:100].strip()}…")
 
@@ -563,7 +586,11 @@ async def main(
 
             if "login" in page.url or "checkpoint" in page.url:
                 log("NOT LOGGED IN — cookies פגו תוקף!", "ERROR")
-                log("הרץ fb_export_cookies.py ועדכן את fb_cookies.json", "ERROR")
+                await send_telegram_alert(
+                    "🚨 <b>Cocochoco Bot — כישלון קריטי</b>\n"
+                    "הבוט לא הצליח להתחבר לפייסבוק — ה-Cookies פגו תוקף.\n"
+                    "יש לחדש את fb_cookies.json ולעדכן ב-Railway."
+                )
                 await browser.close()
                 return
 
@@ -577,6 +604,7 @@ async def main(
             posted  = load_posted()
             ok = fail = skipped = 0
             total   = len(group_ids)
+            sample_size = min(3, len(image_pool))
 
             for i, gid in enumerate(group_ids, 1):
                 log(f"[{i}/{total}] {gid}")
@@ -585,11 +613,21 @@ async def main(
                     skipped += 1
                     continue
 
-                success = await post_to_group(page, gid, images, post_text)
+                # Each group gets its own random image selection
+                group_images = random.sample(image_pool, sample_size)
+
+                success, retryable = await post_to_group(page, gid, group_images, post_text)
+
+                if not success and retryable:
+                    log(f"  Transient failure — retrying in 15s…", "WARN")
+                    await page.wait_for_timeout(15000)
+                    success, _ = await post_to_group(page, gid, group_images, post_text)
+
                 if success:
                     ok += 1
                     posted.add(gid)
                 else:
+                    mark_failed(gid, "permanent failure" if not retryable else "retry also failed")
                     fail += 1
 
                 if i < total:
@@ -604,7 +642,7 @@ async def main(
                     for line in fh:
                         log(f"  {line.strip()}", "ERROR")
 
-            image_names = [Path(p).name for p in images]
+            image_names = [Path(p).name for p in image_pool]
             await send_telegram_report(
                 campaign_name=campaign["campaign_name"],
                 ok=ok,
@@ -613,7 +651,7 @@ async def main(
                 post_text=post_text,
                 image_names=image_names,
             )
-            await send_telegram_photos(images)
+            await send_telegram_photos(image_pool)
 
         finally:
             await browser.close()
