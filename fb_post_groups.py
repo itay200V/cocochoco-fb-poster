@@ -710,6 +710,20 @@ async def main(
             total       = len(group_ids)
             sample_size = min(3, len(image_pool))
 
+            def pick_group_files() -> list[str]:
+                """Return a fresh random media selection for one group."""
+                if media_type == "images":
+                    return random.sample(image_pool, sample_size)
+                elif media_type == "video":
+                    return [video_path] if video_path else []
+                else:  # mixed
+                    if image_pool and video_path:
+                        return [random.choice(image_pool), video_path]
+                    return image_pool[:1] or ([video_path] if video_path else [])
+
+            # Build Telegram preview once (same logic — 3 files, like any single group)
+            telegram_preview = pick_group_files()
+
             for i, gid in enumerate(group_ids, 1):
                 log(f"[{i}/{total}] {gid}")
                 if gid in posted:
@@ -717,24 +731,16 @@ async def main(
                     skipped += 1
                     continue
 
-                # Build per-group file list based on media_type
-                if media_type == "images":
-                    group_files = random.sample(image_pool, sample_size)
-                elif media_type == "video":
-                    group_files = [video_path] if video_path else []
-                else:  # mixed
-                    group_files = (
-                        [random.choice(image_pool), video_path]
-                        if image_pool and video_path
-                        else (image_pool[:1] or ([video_path] if video_path else []))
-                    )
+                # Each group gets its own independent random selection
+                group_files = pick_group_files()
+                log(f"  Media: {[Path(p).name for p in group_files]}")
 
                 success, retryable = await post_to_group(page, gid, group_files, post_text)
 
                 if not success and retryable:
                     log(f"  Transient failure — retrying in 15s…", "WARN")
                     await page.wait_for_timeout(15000)
-                    success, _ = await post_to_group(page, gid, group_images, post_text)
+                    success, _ = await post_to_group(page, gid, group_files, post_text)
 
                 if success:
                     ok += 1
@@ -755,9 +761,7 @@ async def main(
                     for line in fh:
                         log(f"  {line.strip()}", "ERROR")
 
-            media_names = [Path(p).name for p in image_pool]
-            if video_path:
-                media_names.append(Path(video_path).name)
+            media_names = [Path(p).name for p in telegram_preview]
             await send_telegram_report(
                 campaign_name=campaign["campaign_name"],
                 ok=ok,
@@ -767,7 +771,9 @@ async def main(
                 media_type=media_type,
                 media_names=media_names,
             )
-            await send_telegram_media(image_pool, video_path, media_type)
+            tg_images = [p for p in telegram_preview if not p.endswith((".mp4", ".mov", ".avi"))]
+            tg_video  = next((p for p in telegram_preview if p.endswith((".mp4", ".mov", ".avi"))), video_path if media_type in ("video", "mixed") else None)
+            await send_telegram_media(tg_images, tg_video, media_type)
 
         finally:
             await browser.close()
