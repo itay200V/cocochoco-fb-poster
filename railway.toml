@@ -1,9 +1,1 @@
 [deploy]
-
-[[cronjobs]]
-schedule = "0 1,6,12 * * *"
-command = "python fb_post_groups.py"
-
-[[cronjobs]]
-schedule = "0 16 * * *"
-command = "python fb_performance_tracker.py"
