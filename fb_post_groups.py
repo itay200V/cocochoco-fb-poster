@@ -64,6 +64,15 @@ FIXED_CONTACT = (
     "\n📝 ลงทะเบียน: https://forms.gle/b78oEZGFbegABH2Y6"
 )
 
+CONTENT_ANGLES = [
+    "skill",       # Skill Development
+    "business",    # Business Growth
+    "community",   # Professional Community
+    "product",     # Product Experience
+    "partnership", # Partnership Opportunity
+    "brand",       # International Brand Story
+]
+
 # Failure reasons that must NOT trigger a retry
 PERMANENT_REASONS = (
     "posting disabled",
@@ -241,48 +250,171 @@ def load_system_guidelines() -> str:
             log(f"{filename} not found — skipping", "WARN")
     return "\n\n---\n\n".join(parts)
 
+# ─── Post History ─────────────────────────────────────────────────────────────
+
+def load_post_history(sheet_id: str) -> list[dict]:
+    """טוען 10 פוסטים אחרונים מ-post_history sheet"""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        info = json.loads(sa_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        sa_file = SCRIPT_DIR / "service_account.json"
+        creds = Credentials.from_service_account_file(str(sa_file), scopes=SCOPES)
+
+    try:
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(sheet_id).worksheet("post_history")
+        records = ws.get_all_records()
+        return records[-10:] if len(records) > 10 else records
+    except Exception as exc:
+        log(f"Could not load post_history: {exc}", "WARN")
+        return []
+
+
+def pick_next_angle(history: list[dict]) -> str:
+    """בוחר angle שלא שומש לאחרונה"""
+    used_recently = [r.get("angle_used", "") for r in history[-6:]]
+    available = [a for a in CONTENT_ANGLES if a not in used_recently]
+    if not available:
+        available = CONTENT_ANGLES  # fallback — כל ה-6 שומשו, מתחיל מחדש
+    chosen = random.choice(available)
+    log(f"Angle chosen: {chosen} (recently used: {used_recently})")
+    return chosen
+
+
+def save_post_to_history(
+    sheet_id: str,
+    campaign_name: str,
+    angle: str,
+    post_text: str,
+    group_count: int,
+    media_type: str,
+) -> None:
+    """שומר את הריצה ב-post_history sheet"""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        info = json.loads(sa_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        sa_file = SCRIPT_DIR / "service_account.json"
+        creds = Credentials.from_service_account_file(str(sa_file), scopes=SCOPES)
+
+    try:
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(sheet_id).worksheet("post_history")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        snippet = post_text[:100].replace("\n", " ")
+
+        ws.append_row([
+            now,
+            campaign_name,
+            angle,
+            snippet,
+            post_text[:500],
+            group_count,
+            media_type,
+        ])
+        log(f"Saved run to post_history: angle={angle}")
+    except Exception as exc:
+        log(f"Could not save to post_history: {exc}", "WARN")
+
+
 # ─── Claude API ───────────────────────────────────────────────────────────────
 
-async def generate_post_text(template_text: str) -> str:
+async def generate_post_variants(
+    template_text: str,
+    sheet_id: str,
+    num_variants: int = 3
+) -> tuple[list[str], str]:
+    """
+    מחזיר (list של 3 גרסאות שונות, angle_used)
+    כל גרסה מתאימה לקבוצות שונות
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log("ANTHROPIC_API_KEY לא מוגדר — משתמש בטקסט המקורי", "WARN")
-        return template_text + FIXED_CONTACT
+        log("ANTHROPIC_API_KEY לא מוגדר", "WARN")
+        fallback = template_text + FIXED_CONTACT
+        return [fallback] * num_variants, "fallback"
 
     guidelines = load_system_guidelines()
+    history = load_post_history(sheet_id)
+    angle = pick_next_angle(history)
+
+    history_context = ""
+    if history:
+        history_context = "\n\nPOSTS FROM LAST RUNS (DO NOT REPEAT THESE):\n"
+        for h in history[-5:]:
+            history_context += f"- [{h.get('angle_used','')}] {h.get('post_snippet','')}\n"
+
+    angle_instructions = {
+        "skill":       "Focus on SKILL DEVELOPMENT. Opening: a question about staying competitive.",
+        "business":    "Focus on BUSINESS GROWTH. Opening: ROI numbers or revenue potential.",
+        "community":   "Focus on PROFESSIONAL COMMUNITY. Opening: invitation to meet peers.",
+        "product":     "Focus on PRODUCT EXPERIENCE. Opening: sensory/visual result description.",
+        "partnership": "Focus on PARTNERSHIP OPPORTUNITY. Opening: exclusive partner benefits.",
+        "brand":       "Focus on INTERNATIONAL BRAND STORY. Opening: global credibility.",
+    }
+
+    angle_instruction = angle_instructions.get(angle, "")
 
     try:
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=api_key)
 
         system_prompt = guidelines if guidelines else (
-            "You are a Thai social media copywriter for COCOCHOCO Academy Bangkok. "
-            "Write natural, warm Facebook group posts in Thai for professional hairstylists. "
-            "Output ONLY the post text — no labels, no explanations."
+            "You are a Thai social media copywriter for COCOCHOCO Academy Bangkok."
+        )
+
+        user_prompt = (
+            f"Write EXACTLY {num_variants} DIFFERENT Facebook group posts for Thai hairstylists.\n\n"
+            f"ANGLE FOR THIS RUN: {angle.upper()}\n"
+            f"{angle_instruction}\n\n"
+            f"RULES:\n"
+            f"- Each post must have a DIFFERENT opening sentence\n"
+            f"- Each post must use a DIFFERENT structure (one more narrative, one more list-based, one more question-led)\n"
+            f"- Each post must use DIFFERENT emoji selection\n"
+            f"- All posts must follow brand_guidelines.md strictly\n"
+            f"- Output ONLY the posts, separated by this exact delimiter: ===VARIANT===\n"
+            f"- No labels, no numbering, no explanations\n\n"
+            f"{history_context}\n\n"
+            f"Campaign template:\n{template_text}"
         )
 
         msg = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
+            model="claude-sonnet-4-20250514",
+            max_tokens=1800,
             system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Write a Facebook group post based on the campaign details above.\n"
-                    "Follow ALL brand and campaign rules strictly.\n"
-                    "Output ONLY the post text — no labels, no explanations.\n\n"
-                    f"Campaign template / additional notes:\n{template_text}"
-                ),
-            }],
+            messages=[{"role": "user", "content": user_prompt}],
         )
 
-        text = msg.content[0].text.strip()
-        log(f"Claude output: {len(text)} chars")
-        return text
+        raw = msg.content[0].text.strip()
+        variants = [v.strip() for v in raw.split("===VARIANT===") if v.strip()]
+
+        if len(variants) < num_variants:
+            log(f"Got {len(variants)} variants instead of {num_variants} — duplicating last", "WARN")
+            while len(variants) < num_variants:
+                variants.append(variants[-1])
+
+        log(f"Generated {len(variants)} variants, angle={angle}")
+        for i, v in enumerate(variants):
+            log(f"  Variant {i+1}: {v[:60]}…")
+
+        return variants[:num_variants], angle
 
     except Exception as exc:
-        log(f"Claude API error: {exc} — using original template", "WARN")
-        return template_text + FIXED_CONTACT
+        log(f"Claude API error: {exc}", "WARN")
+        fallback = template_text + FIXED_CONTACT
+        return [fallback] * num_variants, "fallback"
 
 # ─── Cookies ──────────────────────────────────────────────────────────────────
 
@@ -661,7 +793,12 @@ async def main(
         await send_telegram_alert(msg)
         log(f"Cookie expiry warning sent: {expiring}", "WARN")
 
-    post_text = await generate_post_text(campaign["template_text"])
+    post_variants, angle_used = await generate_post_variants(
+        campaign["template_text"],
+        sheet_id,
+        num_variants=3
+    )
+    post_text = post_variants[0]  # לדוח הטלגרם
     log(f"Post preview: {post_text[:100].strip()}…")
 
     for f in [POSTED_LOG, FAILED_LOG]:
@@ -735,12 +872,15 @@ async def main(
                 group_files = pick_group_files()
                 log(f"  Media: {[Path(p).name for p in group_files]}")
 
-                success, retryable = await post_to_group(page, gid, group_files, post_text)
+                variant_index = i % len(post_variants)  # rotation: 0,1,2,0,1,2,...
+                group_post_text = post_variants[variant_index]
+                log(f"  Using variant {variant_index + 1}/{len(post_variants)}")
+                success, retryable = await post_to_group(page, gid, group_files, group_post_text)
 
                 if not success and retryable:
                     log(f"  Transient failure — retrying in 15s…", "WARN")
                     await page.wait_for_timeout(15000)
-                    success, _ = await post_to_group(page, gid, group_files, post_text)
+                    success, _ = await post_to_group(page, gid, group_files, group_post_text)
 
                 if success:
                     ok += 1
@@ -770,6 +910,14 @@ async def main(
                 post_text=post_text,
                 media_type=media_type,
                 media_names=media_names,
+            )
+            save_post_to_history(
+                sheet_id=sheet_id,
+                campaign_name=campaign["campaign_name"],
+                angle=angle_used,
+                post_text=post_text,
+                group_count=ok,
+                media_type=media_type,
             )
             tg_images = [p for p in telegram_preview if not p.endswith((".mp4", ".mov", ".avi"))]
             tg_video  = next((p for p in telegram_preview if p.endswith((".mp4", ".mov", ".avi"))), video_path if media_type in ("video", "mixed") else None)

@@ -1,3 +1,10 @@
 [deploy]
-# ⏸ PAUSED — cron disabled manually. To resume, uncomment the line below.
-# cronSchedule = "0 1,6,12 * * *"
+startCommand = "python fb_post_groups.py"
+
+[[cronjobs]]
+schedule = "0 1,6,12 * * *"
+command = "python fb_post_groups.py"
+
+[[cronjobs]]
+schedule = "0 16 * * *"
+command = "python fb_performance_tracker.py"
