@@ -1,5 +1,4 @@
 [deploy]
-startCommand = "python fb_post_groups.py"
 
 [[cronjobs]]
 schedule = "0 1,6,12 * * *"
