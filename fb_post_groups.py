@@ -781,17 +781,26 @@ async def main(
         log("הרץ: python3 fb_export_cookies.py", "ERROR")
         sys.exit(1)
 
-    # Proactive cookie expiry warning
+    # Proactive cookie expiry warning — at most once per 24 hours
     expiring = expiring_cookies(cookies, days=3)
     if expiring:
-        msg = (
-            f"⚠️ <b>אזהרה — Cocochoco Bot</b>\n"
-            f"הcookies הבאים פגים תוך 3 ימים:\n"
-            f"<code>{', '.join(expiring)}</code>\n"
-            f"יש לחדש את fb_cookies.json בהקדם."
+        sentinel = os.path.join(_TMP, "fb_cookie_warning_sent.txt")
+        already_sent = (
+            os.path.exists(sentinel)
+            and (datetime.now().timestamp() - os.path.getmtime(sentinel)) < 86400
         )
-        await send_telegram_alert(msg)
-        log(f"Cookie expiry warning sent: {expiring}", "WARN")
+        if not already_sent:
+            msg = (
+                f"⚠️ <b>אזהרה — Cocochoco Bot</b>\n"
+                f"הcookies הבאים פגים תוך 3 ימים:\n"
+                f"<code>{', '.join(expiring)}</code>\n"
+                f"יש לחדש את fb_cookies.json בהקדם."
+            )
+            await send_telegram_alert(msg)
+            open(sentinel, "w").close()
+            log(f"Cookie expiry warning sent: {expiring}", "WARN")
+        else:
+            log(f"Cookie expiry warning suppressed (already sent today): {expiring}", "WARN")
 
     post_variants, angle_used = await generate_post_variants(
         campaign["template_text"],
